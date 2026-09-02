@@ -1,36 +1,45 @@
-export const FB_W = 400;
-export const FB_H = 250;
-export const FOV = 0.9;
-export const PLANE = Math.tan(FOV / 2);
+import {
+  DEMO_PATH,
+  ENEMY_SPAWNS,
+  PICKUP_SPOTS,
+  SPAWN,
+  blocked,
+  castWall,
+  hasLOS,
+  tryMove,
+} from "./map";
 
-export type Mode =
-  | "attract"
-  | "insert"
-  | "ready"
-  | "play"
-  | "wave"
-  | "dead"
-  | "continue"
-  | "gameover"
-  | "initials";
-
+export type Mode = "attract" | "play" | "paused" | "gameover" | "scores";
 export type EnemyKind = "grunt" | "runner" | "tank";
+export type PickupKind = "ammo" | "health" | "credit";
+
+export type Sfx = {
+  coin(): void;
+  shoot(): void;
+  dry(): void;
+  hit(): void;
+  death(): void;
+  wave(): void;
+  pickup(): void;
+  hurt(): void;
+};
 
 export type Enemy = {
   x: number;
   y: number;
+  kind: EnemyKind;
   hp: number;
   maxHp: number;
-  kind: EnemyKind;
   speed: number;
   dmg: number;
   score: number;
+  radius: number;
+  attackCd: number;
+  wanderT: number;
+  wanderA: number;
   alive: boolean;
   hitFlash: number;
-  biteCd: number;
 };
-
-export type PickupKind = "health" | "ammo" | "credit";
 
 export type Pickup = {
   x: number;
@@ -50,231 +59,202 @@ export type Particle = {
   b: number;
 };
 
-export type ScoreRow = {
-  initials: string;
-  score: number;
-  wave: number;
-};
-
 export type Game = {
   mode: Mode;
-  px: number;
-  py: number;
-  pa: number;
-  hp: number;
+  credits: number;
+  lives: number;
+  health: number;
   ammo: number;
   score: number;
   wave: number;
-  lives: number;
-  credits: number;
+  px: number;
+  py: number;
+  pa: number;
+  keys: Record<string, boolean>;
+  mouseDown: boolean;
   enemies: Enemy[];
   pickups: Pickup[];
   particles: Particle[];
-  zbuf: Float32Array;
-  fireCd: number;
-  muzzle: number;
-  hurt: number;
-  shake: number;
+  zbuf: Float64Array;
+  shootCd: number;
   weaponKick: number;
+  muzzle: number;
+  hurtFlash: number;
+  invuln: number;
+  waveMsgT: number;
+  wavePause: number;
+  demoT: number;
+  initials: string;
+  initialSlot: number;
+  submitted: boolean;
+  insertFlash: number;
   time: number;
-  overlayT: number;
-  continueT: number;
-  initials: [string, string, string];
-  cursor: number;
-  board: ScoreRow[];
-  high: number;
 };
 
-import { MAP_H, MAP_W, SPAWNS, START, isWall } from "./map";
+export const FB_W = 400;
+export const FB_H = 250;
+export const PLANE = 0.66;
+const MOVE_SPEED = 3.35;
+const PLAYER_R = 0.18;
 
-export function makeGame(credits = 1): Game {
+const STATS: Record<
+  EnemyKind,
+  { hp: number; speed: number; dmg: number; score: number; radius: number }
+> = {
+  grunt: { hp: 30, speed: 1.15, dmg: 8, score: 100, radius: 0.28 },
+  runner: { hp: 16, speed: 2.35, dmg: 5, score: 150, radius: 0.22 },
+  tank: { hp: 92, speed: 0.72, dmg: 18, score: 400, radius: 0.4 },
+};
+
+export function createGame(): Game {
   return {
     mode: "attract",
-    px: START.x,
-    py: START.y,
-    pa: START.a,
-    hp: 100,
-    ammo: 40,
-    score: 0,
-    wave: 0,
+    credits: 1,
     lives: 3,
-    credits,
+    health: 100,
+    ammo: 50,
+    score: 0,
+    wave: 1,
+    px: SPAWN.x,
+    py: SPAWN.y,
+    pa: SPAWN.a,
+    keys: {},
+    mouseDown: false,
     enemies: [],
     pickups: [],
     particles: [],
-    zbuf: new Float32Array(FB_W),
-    fireCd: 0,
-    muzzle: 0,
-    hurt: 0,
-    shake: 0,
+    zbuf: new Float64Array(FB_W),
+    shootCd: 0,
     weaponKick: 0,
+    muzzle: 0,
+    hurtFlash: 0,
+    invuln: 0,
+    waveMsgT: 0,
+    wavePause: 0,
+    demoT: 0,
+    initials: "AAA",
+    initialSlot: 0,
+    submitted: false,
+    insertFlash: 0,
     time: 0,
-    overlayT: 0,
-    continueT: 9,
-    initials: ["A", "A", "A"],
-    cursor: 0,
-    board: [],
-    high: 20000,
   };
 }
 
-function enemyStats(kind: EnemyKind): Omit<Enemy, "x" | "y" | "alive" | "hitFlash" | "biteCd"> {
-  if (kind === "runner") {
-    return { hp: 18, maxHp: 18, kind, speed: 2.6, dmg: 7, score: 250 };
-  }
-  if (kind === "tank") {
-    return { hp: 90, maxHp: 90, kind, speed: 0.95, dmg: 18, score: 800 };
-  }
-  return { hp: 34, maxHp: 34, kind, speed: 1.45, dmg: 10, score: 120 };
+export function insertCoin(g: Game, sfx: Sfx) {
+  g.credits += 1;
+  sfx.coin();
 }
 
-function pickKind(wave: number): EnemyKind {
-  const r = Math.random();
-  if (wave >= 5 && r < 0.18) return "tank";
-  if (wave >= 2 && r < 0.42) return "runner";
-  return "grunt";
-}
-
-export function spawnWave(g: Game) {
-  g.wave += 1;
-  g.enemies = [];
-  const n = 4 + g.wave * 2;
-  for (let i = 0; i < n; i++) {
-    const s = SPAWNS[(i * 3 + g.wave) % SPAWNS.length];
-    const jitter = (Math.random() - 0.5) * 0.4;
-    const kind = pickKind(g.wave);
-    g.enemies.push({
-      ...enemyStats(kind),
-      x: s.x + jitter,
-      y: s.y + jitter * 0.5,
-      alive: true,
-      hitFlash: 0,
-      biteCd: 0,
-    });
+export function tryStart(g: Game, sfx: Sfx): boolean {
+  if (g.mode === "play" || g.mode === "paused") return false;
+  if (g.credits < 1) {
+    g.insertFlash = 0.8;
+    return false;
   }
-  if (g.wave % 2 === 0) {
-    g.pickups.push({
-      x: 11.5,
-      y: 10.5,
-      kind: "health",
-      t: 0,
-    });
-  }
-  if (g.wave % 3 === 0) {
-    g.pickups.push({ x: 4.5, y: 15.5, kind: "ammo", t: 0 });
-  }
-}
-
-export function resetRun(g: Game) {
-  g.px = START.x;
-  g.py = START.y;
-  g.pa = START.a;
-  g.hp = 100;
-  g.ammo = 40;
-  g.score = 0;
-  g.wave = 0;
-  g.lives = 3;
-  g.enemies = [];
-  g.pickups = [];
-  g.particles = [];
-  g.hurt = 0;
-  g.shake = 0;
-  g.fireCd = 0;
-  g.muzzle = 0;
-  g.weaponKick = 0;
-  g.mode = "ready";
-  g.overlayT = 1.4;
-}
-
-function tryMove(g: Game, nx: number, ny: number) {
-  const r = 0.18;
-  if (!isWall(nx, g.py) && !isWall(nx - r, g.py) && !isWall(nx + r, g.py)) g.px = nx;
-  if (!isWall(g.px, ny) && !isWall(g.px, ny - r) && !isWall(g.px, ny + r)) g.py = ny;
-}
-
-export function movePlayer(g: Game, dt: number, keys: Set<string>, look: number) {
-  g.pa += look;
-  const s = Math.sin(g.pa);
-  const c = Math.cos(g.pa);
-  let mx = 0;
-  let my = 0;
-  if (keys.has("KeyW") || keys.has("ArrowUp")) {
-    mx += c;
-    my += s;
-  }
-  if (keys.has("KeyS") || keys.has("ArrowDown")) {
-    mx -= c;
-    my -= s;
-  }
-  if (keys.has("KeyA") || keys.has("ArrowLeft")) {
-    mx += s;
-    my -= c;
-  }
-  if (keys.has("KeyD") || keys.has("ArrowRight")) {
-    mx -= s;
-    my += c;
-  }
-  const len = Math.hypot(mx, my) || 1;
-  const spd = keys.has("ShiftLeft") || keys.has("ShiftRight") ? 3.4 : 2.35;
-  tryMove(g, g.px + (mx / len) * spd * dt, g.py + (my / len) * spd * dt);
-  void MAP_W;
-  void MAP_H;
-}
-
-export function shoot(g: Game): boolean {
-  if (g.mode !== "play") return false;
-  if (g.fireCd > 0 || g.ammo <= 0) return false;
-  g.ammo -= 1;
-  g.fireCd = 0.16;
-  g.muzzle = 0.08;
-  g.weaponKick = 1;
-  const dirX = Math.cos(g.pa);
-  const dirY = Math.sin(g.pa);
-  let best: Enemy | null = null;
-  let bestD = 18;
-  for (const e of g.enemies) {
-    if (!e.alive) continue;
-    const dx = e.x - g.px;
-    const dy = e.y - g.py;
-    const dist = Math.hypot(dx, dy);
-    const along = dx * dirX + dy * dirY;
-    if (along < 0.2) continue;
-    const perp = Math.abs(dx * dirY - dy * dirX);
-    if (perp > 0.38 + dist * 0.02) continue;
-    if (dist < bestD) {
-      bestD = dist;
-      best = e;
-    }
-  }
-  if (best) {
-    best.hp -= 18;
-    best.hitFlash = 0.12;
-    burst(g, best.x, best.y, 184, 255, 42);
-    if (best.hp <= 0) {
-      best.alive = false;
-      g.score += best.score;
-      burst(g, best.x, best.y, 255, 43, 214);
-      if (Math.random() < 0.28) {
-        g.pickups.push({
-          x: best.x,
-          y: best.y,
-          kind: Math.random() < 0.5 ? "ammo" : "health",
-          t: 0,
-        });
-      }
-    }
-  }
+  g.credits -= 1;
+  startRun(g, sfx);
   return true;
 }
 
+export function startRun(g: Game, sfx: Sfx) {
+  g.mode = "play";
+  g.lives = 3;
+  g.health = 100;
+  g.ammo = 50;
+  g.score = 0;
+  g.wave = 1;
+  g.px = SPAWN.x;
+  g.py = SPAWN.y;
+  g.pa = SPAWN.a;
+  g.shootCd = 0;
+  g.weaponKick = 0;
+  g.muzzle = 0;
+  g.hurtFlash = 0;
+  g.invuln = 1.2;
+  g.waveMsgT = 2.2;
+  g.wavePause = 0;
+  g.initials = "AAA";
+  g.initialSlot = 0;
+  g.submitted = false;
+  g.enemies = [];
+  g.pickups = [];
+  g.particles = [];
+  spawnWave(g);
+  sfx.wave();
+}
+
+function makeEnemy(kind: EnemyKind, x: number, y: number, wave: number): Enemy {
+  const s = STATS[kind];
+  const hpMul = 1 + (wave - 1) * 0.12;
+  const spMul = Math.min(1.45, 1 + (wave - 1) * 0.055);
+  return {
+    x,
+    y,
+    kind,
+    hp: Math.round(s.hp * hpMul),
+    maxHp: Math.round(s.hp * hpMul),
+    speed: s.speed * spMul,
+    dmg: s.dmg,
+    score: s.score,
+    radius: s.radius,
+    attackCd: 0.3,
+    wanderT: Math.random(),
+    wanderA: Math.random() * Math.PI * 2,
+    alive: true,
+    hitFlash: 0,
+  };
+}
+
+function shuffledSpawns(px: number, py: number): Array<{ x: number; y: number }> {
+  const spots = ENEMY_SPAWNS.filter((s) => Math.hypot(s.x - px, s.y - py) > 4.2);
+  for (let i = spots.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const tmp = spots[i];
+    spots[i] = spots[j];
+    spots[j] = tmp;
+  }
+  return spots.length ? spots : [...ENEMY_SPAWNS];
+}
+
+export function spawnWave(g: Game) {
+  const w = g.wave;
+  let nGrunt = 2 + Math.floor(w / 2);
+  let nRunner = w >= 2 ? w : 0;
+  let nTank = w >= 3 ? Math.floor((w - 1) / 2) : 0;
+  let total = nGrunt + nRunner + nTank;
+  if (total > 12) {
+    const scale = 12 / total;
+    nGrunt = Math.max(1, Math.floor(nGrunt * scale));
+    nRunner = Math.floor(nRunner * scale);
+    nTank = Math.max(w >= 3 ? 1 : 0, Math.floor(nTank * scale));
+  }
+  const kinds: EnemyKind[] = [
+    ...Array<EnemyKind>(nGrunt).fill("grunt"),
+    ...Array<EnemyKind>(nRunner).fill("runner"),
+    ...Array<EnemyKind>(nTank).fill("tank"),
+  ];
+  const spots = shuffledSpawns(g.px, g.py);
+  g.enemies = kinds.map((kind, i) => {
+    const s = spots[i % spots.length];
+    const jitter = 0.15 * ((i % 3) - 1);
+    return makeEnemy(kind, s.x + jitter, s.y - jitter, w);
+  });
+  if (w === 1 || w % 2 === 0) {
+    const p = PICKUP_SPOTS[w % PICKUP_SPOTS.length];
+    const kind: PickupKind = w % 3 === 0 ? "credit" : w % 2 === 0 ? "health" : "ammo";
+    g.pickups.push({ x: p.x, y: p.y, kind, t: 0 });
+  }
+}
+
 function burst(g: Game, x: number, y: number, r: number, gb: number, b: number) {
-  for (let i = 0; i < 10; i++) {
+  for (let i = 0; i < 6; i++) {
     const a = Math.random() * Math.PI * 2;
+    const sp = 0.8 + Math.random() * 1.6;
     g.particles.push({
       x,
       y,
-      vx: Math.cos(a) * (1 + Math.random() * 2),
-      vy: Math.sin(a) * (1 + Math.random() * 2),
+      vx: Math.cos(a) * sp,
+      vy: Math.sin(a) * sp,
       life: 0.25 + Math.random() * 0.25,
       r,
       g: gb,
@@ -283,67 +263,255 @@ function burst(g: Game, x: number, y: number, r: number, gb: number, b: number) 
   }
 }
 
-export function tickWorld(g: Game, dt: number) {
-  g.time += dt;
-  g.fireCd = Math.max(0, g.fireCd - dt);
-  g.muzzle = Math.max(0, g.muzzle - dt);
-  g.hurt = Math.max(0, g.hurt - dt);
-  g.shake = Math.max(0, g.shake - dt * 2);
-  g.weaponKick = Math.max(0, g.weaponKick - dt * 8);
-  g.overlayT = Math.max(0, g.overlayT - dt);
+function hitscan(g: Game, sfx: Sfx) {
+  const dirX = Math.cos(g.pa);
+  const dirY = Math.sin(g.pa);
+  const wall = castWall(g.px, g.py, dirX, dirY);
+  let best: Enemy | null = null;
+  let bestD = Math.min(14, wall.dist);
+  for (const e of g.enemies) {
+    if (!e.alive) continue;
+    const dx = e.x - g.px;
+    const dy = e.y - g.py;
+    const depth = dx * dirX + dy * dirY;
+    if (depth < 0.25 || depth > bestD) continue;
+    const lat = Math.abs(-dx * dirY + dy * dirX);
+    if (lat < e.radius + 0.1) {
+      best = e;
+      bestD = depth;
+    }
+  }
+  if (!best) return;
+  best.hp -= 14;
+  best.hitFlash = 0.12;
+  sfx.hit();
+  burst(g, best.x, best.y, 255, 240, 80);
+  if (best.hp <= 0) {
+    best.alive = false;
+    g.score += best.score;
+    burst(g, best.x, best.y, 184, 255, 42);
+    if (Math.random() < 0.28) {
+      const kinds: PickupKind[] = ["ammo", "ammo", "health", "credit"];
+      const kind = kinds[Math.floor(Math.random() * kinds.length)];
+      g.pickups.push({ x: best.x, y: best.y, kind, t: 0 });
+    }
+  }
+}
 
+function updateEnemies(g: Game, dt: number, sfx: Sfx) {
+  for (const e of g.enemies) {
+    if (!e.alive) continue;
+    e.hitFlash = Math.max(0, e.hitFlash - dt);
+    e.attackCd = Math.max(0, e.attackCd - dt);
+    const dx = g.px - e.x;
+    const dy = g.py - e.y;
+    const d = Math.hypot(dx, dy) || 0.001;
+    if (d < 0.62 + e.radius * 0.15) {
+      if (g.invuln <= 0 && e.attackCd <= 0 && g.mode === "play") {
+        e.attackCd = e.kind === "runner" ? 0.5 : e.kind === "tank" ? 1.05 : 0.72;
+        g.health -= e.dmg;
+        g.hurtFlash = 0.38;
+        sfx.hurt();
+      }
+      continue;
+    }
+    let mx = 0;
+    let my = 0;
+    const los = hasLOS(e.x, e.y, g.px, g.py);
+    if (los && d < 13) {
+      mx = dx / d;
+      my = dy / d;
+      if (e.kind === "runner" && d < 2.4) {
+        const sx = -my;
+        const sy = mx;
+        mx = mx * 0.25 + sx * 0.95;
+        my = my * 0.25 + sy * 0.95;
+      }
+    } else {
+      e.wanderT -= dt;
+      if (e.wanderT <= 0) {
+        e.wanderT = 0.7 + Math.random() * 1.3;
+        e.wanderA = Math.random() * Math.PI * 2;
+      }
+      mx = Math.cos(e.wanderA);
+      my = Math.sin(e.wanderA);
+    }
+    const sp = e.speed * dt;
+    const n = tryMove(e.x, e.y, mx * sp, my * sp, e.radius);
+    e.x = n.x;
+    e.y = n.y;
+  }
+}
+
+function updatePickups(g: Game, dt: number, sfx: Sfx) {
+  for (const p of g.pickups) p.t += dt;
+  if (g.mode !== "play") return;
+  g.pickups = g.pickups.filter((p) => {
+    if (Math.hypot(p.x - g.px, p.y - g.py) > 0.48) return true;
+    if (p.kind === "ammo") g.ammo = Math.min(99, g.ammo + 15);
+    if (p.kind === "health") g.health = Math.min(100, g.health + 28);
+    if (p.kind === "credit") g.credits += 1;
+    sfx.pickup();
+    return false;
+  });
+}
+
+function updateDemo(g: Game, dt: number) {
+  g.demoT += dt;
+  const path = DEMO_PATH;
+  const segTime = 2.4;
+  const total = path.length * segTime;
+  const t = g.demoT % total;
+  const i = Math.floor(t / segTime) % path.length;
+  const j = (i + 1) % path.length;
+  const u = (t - i * segTime) / segTime;
+  const a = path[i];
+  const b = path[j];
+  g.px = a.x + (b.x - a.x) * u;
+  g.py = a.y + (b.y - a.y) * u;
+  let da = b.a - a.a;
+  while (da > Math.PI) da -= Math.PI * 2;
+  while (da < -Math.PI) da += Math.PI * 2;
+  g.pa = a.a + da * u;
+  if (g.enemies.length === 0) {
+    g.enemies = [
+      makeEnemy("grunt", 6.5, 9.5, 1),
+      makeEnemy("runner", 17.5, 9.5, 1),
+      makeEnemy("tank", 11.5, 15.5, 1),
+    ];
+  }
+}
+
+export function handleInitialsKey(g: Game, key: string): "submit" | null {
+  if (g.mode !== "gameover" || g.submitted) return null;
+  const k = key.length === 1 ? key.toUpperCase() : key;
+  const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  const chars = g.initials.split("");
+  while (chars.length < 3) chars.push("A");
+  if (k === "ArrowLeft") g.initialSlot = (g.initialSlot + 2) % 3;
+  else if (k === "ArrowRight") g.initialSlot = (g.initialSlot + 1) % 3;
+  else if (k === "ArrowUp") {
+    const i = letters.indexOf(chars[g.initialSlot] || "A");
+    chars[g.initialSlot] = letters[(i + 1) % 26];
+  } else if (k === "ArrowDown") {
+    const i = letters.indexOf(chars[g.initialSlot] || "A");
+    chars[g.initialSlot] = letters[(i + 25) % 26];
+  } else if (k === "Backspace") {
+    chars[g.initialSlot] = "A";
+    g.initialSlot = Math.max(0, g.initialSlot - 1);
+  } else if (/^[A-Z]$/.test(k)) {
+    chars[g.initialSlot] = k;
+    g.initialSlot = Math.min(2, g.initialSlot + 1);
+  } else if (k === "Enter") {
+    g.initials = chars.join("").slice(0, 3);
+    return "submit";
+  }
+  g.initials = chars.join("").slice(0, 3);
+  return null;
+}
+
+export function updateGame(g: Game, dt: number, sfx: Sfx) {
+  const capped = Math.min(0.05, dt);
+  g.time += capped;
+  g.insertFlash = Math.max(0, g.insertFlash - capped);
+  g.weaponKick = Math.max(0, g.weaponKick - capped * 4.5);
+  g.muzzle = Math.max(0, g.muzzle - capped);
+  g.hurtFlash = Math.max(0, g.hurtFlash - capped);
+  g.invuln = Math.max(0, g.invuln - capped);
+  g.shootCd = Math.max(0, g.shootCd - capped);
+  g.waveMsgT = Math.max(0, g.waveMsgT - capped);
   for (const p of g.particles) {
-    p.x += p.vx * dt;
-    p.y += p.vy * dt;
-    p.life -= dt;
+    p.life -= capped;
+    p.x += p.vx * capped;
+    p.y += p.vy * capped;
   }
   g.particles = g.particles.filter((p) => p.life > 0);
 
-  for (const p of g.pickups) p.t += dt;
+  if (g.mode === "attract") {
+    updateDemo(g, capped);
+    updateEnemies(g, capped * 0.35, sfx);
+    return;
+  }
 
-  for (let i = g.pickups.length - 1; i >= 0; i--) {
-    const p = g.pickups[i];
-    if (Math.hypot(p.x - g.px, p.y - g.py) < 0.45) {
-      if (p.kind === "health") g.hp = Math.min(100, g.hp + 32);
-      if (p.kind === "ammo") g.ammo = Math.min(99, g.ammo + 18);
-      if (p.kind === "credit") g.credits += 1;
-      g.pickups.splice(i, 1);
+  if (g.mode !== "play") return;
+
+  const dirX = Math.cos(g.pa);
+  const dirY = Math.sin(g.pa);
+  let mx = 0;
+  let my = 0;
+  if (g.keys["KeyW"] || g.keys["ArrowUp"]) {
+    mx += dirX;
+    my += dirY;
+  }
+  if (g.keys["KeyS"] || g.keys["ArrowDown"]) {
+    mx -= dirX;
+    my -= dirY;
+  }
+  if (g.keys["KeyA"] || g.keys["ArrowLeft"]) {
+    mx += dirY;
+    my -= dirX;
+  }
+  if (g.keys["KeyD"] || g.keys["ArrowRight"]) {
+    mx -= dirY;
+    my += dirX;
+  }
+  const mag = Math.hypot(mx, my);
+  if (mag > 0) {
+    const sp = MOVE_SPEED * capped;
+    const n = tryMove(g.px, g.py, (mx / mag) * sp, (my / mag) * sp, PLAYER_R);
+    g.px = n.x;
+    g.py = n.y;
+    if (blocked(g.px, g.py, PLAYER_R)) {
+      g.px = SPAWN.x;
+      g.py = SPAWN.y;
     }
   }
 
-  let alive = 0;
-  for (const e of g.enemies) {
-    if (!e.alive) continue;
-    alive += 1;
-    e.hitFlash = Math.max(0, e.hitFlash - dt);
-    e.biteCd = Math.max(0, e.biteCd - dt);
-    const dx = g.px - e.x;
-    const dy = g.py - e.y;
-    const dist = Math.hypot(dx, dy) || 1;
-    if (dist > 0.42) {
-      const nx = e.x + (dx / dist) * e.speed * dt;
-      const ny = e.y + (dy / dist) * e.speed * dt;
-      if (!isWall(nx, e.y)) e.x = nx;
-      if (!isWall(e.x, ny)) e.y = ny;
-    } else if (e.biteCd <= 0) {
-      g.hp -= e.dmg;
-      g.hurt = 0.22;
-      g.shake = 0.28;
-      e.biteCd = 0.7;
+  if ((g.mouseDown || g.keys["Space"]) && g.shootCd <= 0) {
+    g.shootCd = 0.17;
+    if (g.ammo <= 0) {
+      sfx.dry();
+      g.weaponKick = 0.25;
+    } else {
+      g.ammo -= 1;
+      g.weaponKick = 1;
+      g.muzzle = 0.05;
+      sfx.shoot();
+      hitscan(g, sfx);
     }
   }
 
-  if (g.hp <= 0) {
+  updateEnemies(g, capped, sfx);
+  updatePickups(g, capped, sfx);
+
+  if (g.health <= 0) {
     g.lives -= 1;
-    g.hp = 100;
-    g.px = START.x;
-    g.py = START.y;
-    g.mode = g.lives > 0 ? "dead" : "continue";
-    g.overlayT = g.lives > 0 ? 1.2 : 0;
-    g.continueT = 9;
-  } else if (alive === 0 && g.mode === "play") {
-    g.mode = "wave";
-    g.overlayT = 1.6;
-    g.score += 400 + g.wave * 50;
+    sfx.death();
+    if (g.lives <= 0) {
+      g.mode = "gameover";
+      g.health = 0;
+      g.initials = "AAA";
+      g.initialSlot = 0;
+      g.submitted = false;
+    } else {
+      g.health = 100;
+      g.invuln = 2.2;
+      g.hurtFlash = 0.7;
+    }
+  }
+
+  const alive = g.enemies.some((e) => e.alive);
+  if (!alive && g.wavePause <= 0 && g.waveMsgT <= 0) {
+    g.wavePause = 2.2;
+  }
+  if (g.wavePause > 0) {
+    g.wavePause -= capped;
+    if (g.wavePause <= 0) {
+      g.wave += 1;
+      g.score += 250;
+      spawnWave(g);
+      g.waveMsgT = 2;
+      sfx.wave();
+    }
   }
 }
